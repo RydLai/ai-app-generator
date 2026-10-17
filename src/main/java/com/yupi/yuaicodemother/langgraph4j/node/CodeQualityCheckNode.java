@@ -26,6 +26,7 @@ public class CodeQualityCheckNode {
         return node_async(state -> {
             WorkflowContext context = WorkflowContext.getContext(state);
             log.info("执行节点: 代码质量检查");
+            context.setErrorMessage(null);
             String generatedCodeDir = context.getGeneratedCodeDir();
             QualityResult qualityResult;
             try {
@@ -46,8 +47,11 @@ public class CodeQualityCheckNode {
                 }
             } catch (Exception e) {
                 log.error("代码质量检查异常: {}", e.getMessage(), e);
+                context.setErrorMessage("代码质量检查服务异常：" + e.getMessage());
                 qualityResult = QualityResult.builder()
-                        .isValid(true) // 异常直接跳到下一个步骤
+                        .isValid(false)
+                        .errors(List.of("代码质量检查异常：" + e.getMessage()))
+                        .suggestions(List.of("请检查质检模型或输入内容后重试"))
                         .build();
             }
             // 3. 更新状态

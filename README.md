@@ -51,6 +51,12 @@
 
 ![](https://pic.yupi.icu/1/1753332482457-e6b13118-e150-45e5-bf36-6cf355cbec19.png)
 
+### 当前代码生成链路
+
+应用创建时，TypeRouter 只执行一次，将 `HTML / MULTI_FILE / VUE_PROJECT` 写入 MySQL 并固定。后续每轮请求统一进入 `/app/chat/gen/code`：HTML 和 MULTI_FILE 固定走 DIRECT；只有 Vue 工程由 ExecutionModeRouter 根据工程是否已生成、确定性规则和轻量模型选择 DIRECT 或 LangGraph4j WORKFLOW。
+
+Vue DIRECT 复用现有单 Agent Tool Calling；WORKFLOW 接收真实 `appId`、`userId` 和固定的 `VUE_PROJECT`，依次执行素材收集、Prompt 增强、代码生成、质量检查、最多 2 次修复和工程构建。两条分支复用聊天记录、Redis 记忆、SSE 和预览，并用带租约的 Redisson 许可避免同一应用并发修改文件和会话，不再提供绕过鉴权的独立 `/workflow/*` 业务入口。当前工作流实时输出节点级进度，尚未接入持久化 Checkpointer，也未逐条透传节点内部模型 Token 与 Tool 事件。
+
 
 
 当你学会这个项目后，你不仅能开发 AI 代码生成器，更能灵活开发各种复杂的 AI 应用：AI 写作助手、AI 设计工具、AI 数据分析平台、AI PPT 制作大师，尽情发挥自己的想象力吧！

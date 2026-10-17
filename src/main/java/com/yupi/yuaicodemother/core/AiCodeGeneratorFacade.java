@@ -77,6 +77,17 @@ public class AiCodeGeneratorFacade {
      * @return 保存的目录
      */
     public Flux<String> generateAndSaveCodeStream(String userMessage, CodeGenTypeEnum codeGenTypeEnum, Long appId) {
+        return generateAndSaveCodeStream(userMessage, codeGenTypeEnum, appId, true);
+    }
+
+    /**
+     * 统一入口：根据类型生成并保存代码（流式）。
+     *
+     * @param buildVueOnComplete Vue Tool Calling 结束后是否立即构建。DIRECT 为 true；
+     *                           WORKFLOW 为 false，由 ProjectBuilderNode 在质检通过后构建。
+     */
+    public Flux<String> generateAndSaveCodeStream(String userMessage, CodeGenTypeEnum codeGenTypeEnum,
+                                                  Long appId, boolean buildVueOnComplete) {
         if (codeGenTypeEnum == null) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "生成类型不能为空");
         }
@@ -93,7 +104,7 @@ public class AiCodeGeneratorFacade {
             }
             case VUE_PROJECT -> {
                 TokenStream tokenStream = aiCodeGeneratorService.generateVueProjectCodeStream(appId, userMessage);
-                yield processTokenStream(tokenStream, appId);
+                yield processTokenStream(tokenStream, appId, buildVueOnComplete);
             }
             default -> {
                 String errorMessage = "不支持的生成类型：" + codeGenTypeEnum.getValue();
@@ -109,7 +120,7 @@ public class AiCodeGeneratorFacade {
      * @param appId       应用 ID
      * @return Flux<String> 流式响应
      */
-    private Flux<String> processTokenStream(TokenStream tokenStream, Long appId) {
+    private Flux<String> processTokenStream(TokenStream tokenStream, Long appId, boolean buildVueOnComplete) {
         return Flux.create(sink -> {
             tokenStream.onPartialResponse((String partialResponse) -> {
                         AiResponseMessage aiResponseMessage = new AiResponseMessage(partialResponse);
@@ -124,10 +135,20 @@ public class AiCodeGeneratorFacade {
                         sink.next(JSONUtil.toJsonStr(toolExecutedMessage));
                     })
                     .onCompleteResponse((ChatResponse response) -> {
-                        // 执行 Vue 项目构建（同步执行，确保预览时项目已就绪）
-                        String projectPath = AppConstant.CODE_OUTPUT_ROOT_DIR + "/vue_project_" + appId;
-                        vueProjectBuilder.buildProject(projectPath);
-                        sink.complete();
+                        try {
+                            if (buildVueOnComplete) {
+                                // DIRECT 链路同步构建；WORKFLOW 在质检通过后由独立节点构建，避免重复构建。
+                                String projectPath = AppConstant.CODE_OUTPUT_ROOT_DIR + "/vue_project_" + appId;
+                                boolean buildSuccess = vueProjectBuilder.buildProject(projectPath);
+                                if (!buildSuccess) {
+                                    sink.error(new BusinessException(ErrorCode.SYSTEM_ERROR, "Vue 项目构建失败"));
+                                    return;
+                                }
+                            }
+                            sink.complete();
+                        } catch (Exception e) {
+                            sink.error(e);
+                        }
                     })
                     .onError((Throwable error) -> {
                         error.printStackTrace();
@@ -151,18 +172,13 @@ public class AiCodeGeneratorFacade {
         return codeStream.doOnNext(chunk -> {
             // 实时收集代码片段
             codeBuilder.append(chunk);
-        }).doOnComplete(() -> {
-            // 流式返回完成后，保存代码
-            try {
-                String completeCode = codeBuilder.toString();
-                // 使用执行器解析代码
-                Object parsedResult = CodeParserExecutor.executeParser(completeCode, codeGenType);
-                // 使用执行器保存代码
-                File saveDir = CodeFileSaverExecutor.executeSaver(parsedResult, codeGenType, appId);
-                log.info("保存成功，目录为：{}", saveDir.getAbsolutePath());
-            } catch (Exception e) {
-                log.error("保存失败: {}", e.getMessage());
-            }
-        });
+        }).concatWith(Flux.defer(() -> {
+            // 只有解析和保存成功后流才完成，避免前端收到 done 但磁盘产物不可用。
+            String completeCode = codeBuilder.toString();
+            Object parsedResult = CodeParserExecutor.executeParser(completeCode, codeGenType);
+            File saveDir = CodeFileSaverExecutor.executeSaver(parsedResult, codeGenType, appId);
+            log.info("保存成功，目录为：{}", saveDir.getAbsolutePath());
+            return Flux.empty();
+        }));
     }
 }

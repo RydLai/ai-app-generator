@@ -11,6 +11,7 @@ import org.bsc.langgraph4j.action.AsyncNodeAction;
 import org.bsc.langgraph4j.prebuilt.MessagesState;
 import reactor.core.publisher.Flux;
 
+import java.io.File;
 import java.time.Duration;
 
 import static org.bsc.langgraph4j.action.AsyncNodeAction.node_async;
@@ -28,17 +29,24 @@ public class CodeGeneratorNode {
             // 构造用户消息（包含原始提示词和可能的错误修复信息）
             String userMessage = buildUserMessage(context);
             CodeGenTypeEnum generationType = context.getGenerationType();
+            if (generationType != CodeGenTypeEnum.VUE_PROJECT) {
+                throw new IllegalStateException("WORKFLOW 当前仅支持固定类型 VUE_PROJECT");
+            }
             // 获取 AI 代码生成外观服务
             AiCodeGeneratorFacade codeGeneratorFacade = SpringContextUtil.getBean(AiCodeGeneratorFacade.class);
             log.info("开始生成代码，类型: {} ({})", generationType.getValue(), generationType.getText());
-            // 先使用固定的 appId (后续再整合到业务中)
-            Long appId = 0L;
-            // 调用流式代码生成
-            Flux<String> codeStream = codeGeneratorFacade.generateAndSaveCodeStream(userMessage, generationType, appId);
+            Long appId = context.getAppId();
+            if (appId == null || appId <= 0) {
+                throw new IllegalStateException("WORKFLOW 缺少有效的 appId");
+            }
+            // 只生成和保存源码；质检通过后由 ProjectBuilderNode 统一构建，避免重复执行 npm build。
+            Flux<String> codeStream = codeGeneratorFacade.generateAndSaveCodeStream(
+                    userMessage, generationType, appId, false);
             // 同步等待流式输出完成
             codeStream.blockLast(Duration.ofMinutes(10)); // 最多等待 10 分钟
             // 根据类型设置生成目录
-            String generatedCodeDir = String.format("%s/%s_%s", AppConstant.CODE_OUTPUT_ROOT_DIR, generationType.getValue(), appId);
+            String generatedCodeDir = AppConstant.CODE_OUTPUT_ROOT_DIR + File.separator
+                    + generationType.getValue() + "_" + appId;
             log.info("AI 代码生成完成，生成目录: {}", generatedCodeDir);
 
             // 更新状态
@@ -56,8 +64,8 @@ public class CodeGeneratorNode {
         // 检查是否存在质检失败结果
         QualityResult qualityResult = context.getQualityResult();
         if (isQualityCheckFailed(qualityResult)) {
-            // 直接将错误修复信息作为新的提示词（起到了修改的作用）
-            userMessage = buildErrorFixPrompt(qualityResult);
+            // 保留原需求和素材上下文，再附加本轮质检结果，避免修复时丢失任务目标。
+            userMessage = userMessage + buildErrorFixPrompt(qualityResult);
         }
         return userMessage;
     }

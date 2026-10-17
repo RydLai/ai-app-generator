@@ -96,8 +96,13 @@ public class AiCodeGeneratorServiceFactory {
                 .chatMemoryStore(redisChatMemoryStore)
                 .maxMessages(20)
                 .build();
-        // 从数据库中加载对话历史到记忆中
-        chatHistoryService.loadChatHistoryToMemory(appId, chatMemory, 20);
+        // Redis 中已有窗口时直接复用；只有上下文缺失时才从 MySQL 回填。
+        // AppService 会在写入本轮用户消息前预热 Service，因此回填内容不包含本轮消息，避免重复入记忆。
+        if (chatMemory.messages().isEmpty()) {
+            chatHistoryService.loadChatHistoryToMemory(appId, chatMemory, 20);
+        } else {
+            log.info("复用 appId: {} 的 Redis 会话上下文，共 {} 条消息", appId, chatMemory.messages().size());
+        }
         return switch (codeGenType) {
             // Vue 项目生成，使用工具调用和推理模型
             case VUE_PROJECT -> {

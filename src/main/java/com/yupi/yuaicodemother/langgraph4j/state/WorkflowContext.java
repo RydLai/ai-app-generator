@@ -35,6 +35,21 @@ public class WorkflowContext implements Serializable {
     private String currentStep;
 
     /**
+     * 本次工作流运行标识，仅用于日志关联；当前未实现持久化 Checkpointer。
+     */
+    private String workflowRunId;
+
+    /**
+     * 真实应用 ID，由主聊天链路传入。
+     */
+    private Long appId;
+
+    /**
+     * 当前登录用户 ID，由主聊天链路传入。
+     */
+    private Long userId;
+
+    /**
      * 用户原始输入的提示词
      */
     private String originalPrompt;
@@ -73,6 +88,18 @@ public class WorkflowContext implements Serializable {
      * 质量检查结果
      */
     private QualityResult qualityResult;
+
+    /**
+     * 已执行的质检修复次数。
+     */
+    @Builder.Default
+    private int retryCount = 0;
+
+    /**
+     * 允许的最大质检修复次数。
+     */
+    @Builder.Default
+    private int maxRetries = 2;
 
     /**
      * 错误信息

@@ -28,6 +28,9 @@ public class ProjectBuilderNode {
             // 获取必要的参数
             String generatedCodeDir = context.getGeneratedCodeDir();
             CodeGenTypeEnum generationType = context.getGenerationType();
+            if (generationType != CodeGenTypeEnum.VUE_PROJECT) {
+                throw new BusinessException(ErrorCode.PARAMS_ERROR, "WORKFLOW 仅支持 Vue 工程构建");
+            }
             String buildResultDir;
             // 一定是 Vue 项目类型：使用 VueProjectBuilder 进行构建
             try {
@@ -41,9 +44,11 @@ public class ProjectBuilderNode {
                 } else {
                     throw new BusinessException(ErrorCode.SYSTEM_ERROR, "Vue 项目构建失败");
                 }
+            } catch (BusinessException e) {
+                throw e;
             } catch (Exception e) {
                 log.error("Vue 项目构建异常: {}", e.getMessage(), e);
-                buildResultDir = generatedCodeDir; // 异常时返回原路径
+                throw new BusinessException(ErrorCode.SYSTEM_ERROR, "Vue 项目构建异常：" + e.getMessage());
             }
             // 更新状态
             context.setCurrentStep("项目构建");

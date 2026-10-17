@@ -9,10 +9,12 @@ import com.mybatisflex.core.query.QueryWrapper;
 import com.mybatisflex.spring.service.impl.ServiceImpl;
 import com.yupi.yuaicodemother.ai.AiCodeGenTypeRoutingService;
 import com.yupi.yuaicodemother.ai.AiCodeGenTypeRoutingServiceFactory;
+import com.yupi.yuaicodemother.ai.AiCodeGeneratorServiceFactory;
 import com.yupi.yuaicodemother.constant.AppConstant;
 import com.yupi.yuaicodemother.core.AiCodeGeneratorFacade;
 import com.yupi.yuaicodemother.core.builder.VueProjectBuilder;
 import com.yupi.yuaicodemother.core.handler.StreamHandlerExecutor;
+import com.yupi.yuaicodemother.core.routing.ExecutionModeRouter;
 import com.yupi.yuaicodemother.exception.BusinessException;
 import com.yupi.yuaicodemother.exception.ErrorCode;
 import com.yupi.yuaicodemother.exception.ThrowUtils;
@@ -23,16 +25,20 @@ import com.yupi.yuaicodemother.mapper.AppMapper;
 import com.yupi.yuaicodemother.model.entity.User;
 import com.yupi.yuaicodemother.model.enums.ChatHistoryMessageTypeEnum;
 import com.yupi.yuaicodemother.model.enums.CodeGenTypeEnum;
+import com.yupi.yuaicodemother.model.enums.ExecutionModeEnum;
 import com.yupi.yuaicodemother.model.vo.AppVO;
 import com.yupi.yuaicodemother.model.vo.UserVO;
 import com.yupi.yuaicodemother.monitor.MonitorContext;
 import com.yupi.yuaicodemother.monitor.MonitorContextHolder;
+import com.yupi.yuaicodemother.langgraph4j.CodeGenWorkflow;
 import com.yupi.yuaicodemother.service.AppService;
 import com.yupi.yuaicodemother.service.ChatHistoryService;
 import com.yupi.yuaicodemother.service.ScreenshotService;
 import com.yupi.yuaicodemother.service.UserService;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RPermitExpirableSemaphore;
+import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
@@ -44,6 +50,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -79,6 +86,18 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
     @Resource
     private AiCodeGenTypeRoutingServiceFactory aiCodeGenTypeRoutingServiceFactory;
 
+    @Resource
+    private AiCodeGeneratorServiceFactory aiCodeGeneratorServiceFactory;
+
+    @Resource
+    private ExecutionModeRouter executionModeRouter;
+
+    @Resource
+    private CodeGenWorkflow codeGenWorkflow;
+
+    @Resource
+    private RedissonClient redissonClient;
+
     @Override
     public Flux<String> chatToGenCode(Long appId, String message, User loginUser) {
         // 1. 参数校验
@@ -97,23 +116,66 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
         if (codeGenTypeEnum == null) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "应用代码生成类型错误");
         }
-        // 5. 在调用 AI 前，先保存用户消息到数据库中
-        chatHistoryService.addChatMessage(appId, message, ChatHistoryMessageTypeEnum.USER.getValue(), loginUser.getId());
-        // 6. 设置监控上下文（用户 ID 和应用 ID）
+        // 同一应用只能有一个生成任务修改文件和会话。permitId 可跨线程释放，适合 Reactor/虚拟线程链路。
+        RPermitExpirableSemaphore appGenerationSemaphore = redissonClient
+                .getPermitExpirableSemaphore("agent:app:generation:" + appId);
+        appGenerationSemaphore.trySetPermits(1);
+        String permitId;
+        try {
+            permitId = appGenerationSemaphore.tryAcquire(0, 60, TimeUnit.MINUTES);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "获取应用生成许可时被中断");
+        }
+        ThrowUtils.throwIf(permitId == null, ErrorCode.OPERATION_ERROR, "该应用已有生成任务正在执行");
+        // 5. 设置监控上下文（用户 ID 和应用 ID）
         MonitorContextHolder.setContext(
                 MonitorContext.builder()
                         .userId(loginUser.getId().toString())
                         .appId(appId.toString())
                         .build()
         );
-        // 7. 调用 AI 生成代码（流式）
-        Flux<String> codeStream = aiCodeGeneratorFacade.generateAndSaveCodeStream(message, codeGenTypeEnum, appId);
-        // 8. 收集 AI 响应的内容，并且在完成后保存记录到对话历史
-        return streamHandlerExecutor.doExecute(codeStream, chatHistoryService, appId, loginUser, codeGenTypeEnum)
-                .doFinally(signalType -> {
-                    // 流结束时清理（无论成功/失败/取消）
-                    MonitorContextHolder.clearContext();
-                });
+        try {
+            // 6. codeGenType 是应用级固定属性；HTML / MULTI_FILE 固定 DIRECT，只有 Vue 按本轮任务选择模式
+            ExecutionModeEnum executionMode = codeGenTypeEnum == CodeGenTypeEnum.VUE_PROJECT
+                    ? executionModeRouter.route(appId, codeGenTypeEnum, message)
+                    : ExecutionModeEnum.DIRECT;
+
+            // 7. 在写入本轮 USER 之前确保 AI Service 已恢复旧上下文，避免缓存未命中时重复回填本轮消息
+            aiCodeGeneratorServiceFactory.getAiCodeGeneratorService(appId, codeGenTypeEnum);
+            boolean userMessageSaved = chatHistoryService.addChatMessage(
+                    appId, message, ChatHistoryMessageTypeEnum.USER.getValue(), loginUser.getId());
+            ThrowUtils.throwIf(!userMessageSaved, ErrorCode.OPERATION_ERROR, "保存用户消息失败");
+
+            log.info("代码生成路由完成，appId: {}, codeGenType: {}, executionMode: {}",
+                    appId, codeGenTypeEnum, executionMode);
+
+            // 路由和预热发生在当前 servlet 线程，先清理；订阅执行时重新绑定，避免 ThreadLocal 泄漏。
+            MonitorContextHolder.clearContext();
+            // 8. DIRECT 复用现有生成链路；复杂 Vue 请求进入 LangGraph4j 工作流。
+            // 9. 两种执行模式复用相同的流处理、AI 消息持久化和 SSE 输出协议。
+            return Flux.defer(() -> {
+                        MonitorContextHolder.setContext(MonitorContext.builder()
+                                .userId(loginUser.getId().toString())
+                                .appId(appId.toString())
+                                .build());
+                        Flux<String> codeStream = executionMode == ExecutionModeEnum.WORKFLOW
+                                ? codeGenWorkflow.executeWorkflowWithFlux(
+                                        appId, loginUser.getId(), codeGenTypeEnum, message)
+                                : aiCodeGeneratorFacade.generateAndSaveCodeStream(
+                                        message, codeGenTypeEnum, appId);
+                        return streamHandlerExecutor.doExecute(
+                                codeStream, chatHistoryService, appId, loginUser, codeGenTypeEnum);
+                    })
+                    .doFinally(signalType -> {
+                        MonitorContextHolder.clearContext();
+                        appGenerationSemaphore.tryRelease(permitId);
+                    });
+        } catch (RuntimeException e) {
+            MonitorContextHolder.clearContext();
+            appGenerationSemaphore.tryRelease(permitId);
+            throw e;
+        }
     }
 
     @Override

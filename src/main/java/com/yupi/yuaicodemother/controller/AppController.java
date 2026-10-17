@@ -68,21 +68,31 @@ public class AppController {
         User loginUser = userService.getLoginUser(request);
         // 调用服务生成代码（SSE 流式返回）
         Flux<String> contentFlux = appService.chatToGenCode(appId, message, loginUser);
-        return contentFlux
+        Flux<ServerSentEvent<String>> successFlux = contentFlux
                 .map(chunk -> {
                     Map<String, String> wrapper = Map.of("d", chunk);
                     String jsonData = JSONUtil.toJsonStr(wrapper);
                     return ServerSentEvent.<String>builder()
                             .data(jsonData)
                             .build();
-                })
+                });
+        return successFlux
                 .concatWith(Mono.just(
                         // 发送结束事件
                         ServerSentEvent.<String>builder()
                                 .event("done")
                                 .data("")
                                 .build()
-                ));
+                ))
+                // 异步生成/保存/构建异常发生时响应通常已开始，转为前端已支持的业务错误事件。
+                .onErrorResume(error -> {
+                    String errorMessage = StrUtil.blankToDefault(error.getMessage(), "生成过程中出现错误");
+                    String errorData = JSONUtil.toJsonStr(Map.of("message", errorMessage));
+                    return Mono.just(ServerSentEvent.<String>builder()
+                            .event("business-error")
+                            .data(errorData)
+                            .build());
+                });
     }
 
     /**

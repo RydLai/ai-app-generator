@@ -1,7 +1,6 @@
 package com.yupi.yuaicodemother.langgraph4j.config;
 
 import com.yupi.yuaicodemother.langgraph4j.CodeGenWorkflow;
-import org.bsc.langgraph4j.GraphStateException;
 import org.bsc.langgraph4j.studio.springboot.AbstractLangGraphStudioConfig;
 import org.bsc.langgraph4j.studio.springboot.LangGraphFlow;
 import org.springframework.context.annotation.Configuration;
@@ -14,8 +13,8 @@ public class LangGraphStudioSampleConfig extends AbstractLangGraphStudioConfig {
 
     final LangGraphFlow flow;
 
-    public LangGraphStudioSampleConfig() throws GraphStateException {
-        var workflow = new CodeGenWorkflow().createWorkflow().stateGraph;
+    public LangGraphStudioSampleConfig(CodeGenWorkflow codeGenWorkflow) {
+        var workflow = codeGenWorkflow.createWorkflow().stateGraph;
         // define your workflow   
         this.flow = LangGraphFlow.builder()
                 .title("LangGraph Studio")
