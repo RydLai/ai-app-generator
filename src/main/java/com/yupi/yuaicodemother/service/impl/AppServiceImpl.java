@@ -65,6 +65,13 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
     @Value("${code.deploy-host:http://localhost}")
     private String deployHost;
 
+    /**
+     * 用于智能路由的模型 Key。未配置有效 Key 时，退回本地规则选择生成类型，
+     * 这样只需要一个代码生成模型 Key 也能正常创建应用。
+     */
+    @Value("${langchain4j.open-ai.routing-chat-model.api-key:}")
+    private String routingApiKey;
+
     @Resource
     private UserService userService;
 
@@ -189,9 +196,8 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
         app.setUserId(loginUser.getId());
         // 应用名称暂时为 initPrompt 前 12 位
         app.setAppName(initPrompt.substring(0, Math.min(initPrompt.length(), 12)));
-        // 使用 AI 智能选择代码生成类型（多例模式）
-        AiCodeGenTypeRoutingService aiCodeGenTypeRoutingService = aiCodeGenTypeRoutingServiceFactory.createAiCodeGenTypeRoutingService();
-        CodeGenTypeEnum selectedCodeGenType = aiCodeGenTypeRoutingService.routeCodeGenType(initPrompt);
+        // 使用 AI 智能选择代码生成类型；路由模型不可用时使用本地规则兜底
+        CodeGenTypeEnum selectedCodeGenType = selectCodeGenType(initPrompt);
         app.setCodeGenType(selectedCodeGenType.getValue());
         // 插入数据库
         boolean result = this.save(app);
@@ -341,6 +347,59 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
                 .eq("priority", priority)
                 .eq("userId", userId)
                 .orderBy(sortField, "ascend".equals(sortOrder));
+    }
+
+    /**
+     * 选择代码生成类型：优先使用 AI 路由；路由模型不可用时使用本地规则兜底。
+     *
+     * @param initPrompt 初始化提示词
+     * @return 代码生成类型
+     */
+    private CodeGenTypeEnum selectCodeGenType(String initPrompt) {
+        if (isUsableApiKey(routingApiKey)) {
+            try {
+                AiCodeGenTypeRoutingService routingService =
+                        aiCodeGenTypeRoutingServiceFactory.createAiCodeGenTypeRoutingService();
+                return routingService.routeCodeGenType(initPrompt);
+            } catch (Exception e) {
+                log.warn("AI 类型路由失败，改用本地规则：{}", e.getMessage());
+            }
+        } else {
+            log.info("未配置有效的路由模型 API Key，使用本地规则选择生成类型");
+        }
+        return routeLocally(initPrompt);
+    }
+
+    /**
+     * 判断 API Key 是否已真实配置，过滤配置文件中的占位符。
+     */
+    private boolean isUsableApiKey(String apiKey) {
+        if (StrUtil.isBlank(apiKey)) {
+            return false;
+        }
+        String normalized = apiKey.trim().toLowerCase();
+        return !normalized.contains("<")
+                && !normalized.contains("your")
+                && !normalized.contains("placeholder");
+    }
+
+    /**
+     * 本地类型路由规则：只在路由模型不可用时使用。
+     */
+    private CodeGenTypeEnum routeLocally(String initPrompt) {
+        String text = StrUtil.blankToDefault(initPrompt, "").toLowerCase();
+        if (text.contains("vue")
+                || text.contains("后台管理")
+                || text.contains("数据管理")
+                || text.contains("复杂交互")) {
+            return CodeGenTypeEnum.VUE_PROJECT;
+        }
+        if (text.contains("多文件")
+                || text.contains("多页面")
+                || text.contains("多个页面")) {
+            return CodeGenTypeEnum.MULTI_FILE;
+        }
+        return CodeGenTypeEnum.HTML;
     }
 
     /**
